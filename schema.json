@@ -1,0 +1,49 @@
+[
+  {
+    "number": 123,
+    "title": "How to deploy on Vercel?",
+    "body": "I have an issue with deployment...",
+    "createdAt": "2024-11-01T10:20:30Z",
+    "category": {
+      "id": "DIC_kwDOExample4c4",
+      "name": "Q&A"
+    },
+    "comments": [
+      {
+        "body": "You need to connect your GitHub repo.",
+        "createdAt": "2024-11-01T11:00:00Z",
+        "author": {
+          "login": "octocat"
+        },
+        "replies": [
+          {
+            "body": "Thanks! That worked.",
+            "createdAt": "2024-11-01T11:05:00Z",
+            "author": {
+              "login": "newuser"
+            }
+          }
+        ]
+      },
+      {
+        "body": "Alternatively, you can use the CLI.",
+        "createdAt": "2024-11-01T12:00:00Z",
+        "author": {
+          "login": "devguru"
+        },
+        "replies": []
+      }
+    ]
+  },
+  {
+    "number": 124,
+    "title": "Best practices for serverless DBs",
+    "body": "How do I scale DynamoDB with serverless functions?",
+    "createdAt": "2024-10-30T09:30:00Z",
+    "category": {
+      "id": "DIC_kwDOExample5f3",
+      "name": "Ideas"
+    },
+    "comments": []
+  }
+]
