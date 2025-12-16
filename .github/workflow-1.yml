@@ -1,0 +1,183 @@
+name: Batch Migrate GitLab Repositories to GitHub (Mirror + LFS + Branch Verification)
+
+on:
+  workflow_dispatch:
+    inputs:
+      URLS:
+        description: "Newline-separated list of repository URLs"
+        required: true
+        type: string
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git git-lfs curl jq
+          git lfs install --system
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "git-migration-bot"
+          git config --global user.email "migration@github.com"
+
+      - name: Batch migrate repositories
+        env:
+          URLS: ${{ inputs.URLS }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN_MIGRATION }}
+          GH_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -u
+
+          create_issue() {
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${GH_OWNER}/${TARGET_REPO}/issues" \
+              -d "{
+                \"title\": \"Migration log: ${TARGET_REPO}\",
+                \"body\": \"$1\"
+              }" | jq -r .number
+          }
+
+          comment_issue() {
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${GH_OWNER}/${TARGET_REPO}/issues/$1/comments" \
+              -d "{ \"body\": \"$2\" }"
+          }
+
+          close_issue() {
+            curl -s -X PATCH \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${GH_OWNER}/${TARGET_REPO}/issues/$1" \
+              -d '{ "state": "closed" }'
+          }
+
+          echo "$URLS" | while read -r URL; do
+            [ -z "$URL" ] && continue
+
+            START_TS="$(date -u)"
+
+            STRIPPED="${URL#https://}"
+            STRIPPED="${STRIPPED#http://}"
+
+            NAMESPACE="$(basename "$(dirname "$STRIPPED")")"
+            REPO="$(basename "$STRIPPED")"
+            TARGET_REPO="${NAMESPACE}—${REPO}"
+
+            echo "Migrating $URL → $TARGET_REPO"
+
+            # --- Create repo if missing ---
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${GH_OWNER}/${TARGET_REPO}")
+
+            if [ "$STATUS" -eq 404 ]; then
+              OWNER_TYPE=$(curl -s \
+                -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/users/${GH_OWNER}" | jq -r .type)
+
+              if [ "$OWNER_TYPE" = "Organization" ]; then
+                CREATE_URL="https://api.github.com/orgs/${GH_OWNER}/repos"
+              else
+                CREATE_URL="https://api.github.com/user/repos"
+              fi
+
+              curl -s -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                "$CREATE_URL" \
+                -d "{
+                  \"name\": \"${TARGET_REPO}\",
+                  \"private\": true,
+                  \"auto_init\": false
+                }"
+            fi
+
+            ISSUE_NUMBER=$(create_issue "### Migration started\n\n**Source:** ${URL}\n**Started:** ${START_TS}")
+
+            set +e
+            rm -rf repo.git verify-src verify-dst
+
+            git clone --mirror \
+              https://oauth2:${GITLAB_TOKEN}@${STRIPPED} \
+              repo.git || {
+                comment_issue "$ISSUE_NUMBER" "❌ **Mirror clone failed**"
+                continue
+              }
+
+            cd repo.git
+            git lfs fetch --all
+
+            git remote set-url origin \
+              "https://${GH_TOKEN}@github.com/${GH_OWNER}/${TARGET_REPO}.git"
+
+            git push --mirror || {
+              comment_issue "$ISSUE_NUMBER" "❌ **Mirror push failed**"
+              cd ..
+              continue
+            }
+
+            git lfs push --all origin || {
+              comment_issue "$ISSUE_NUMBER" "⚠️ **LFS push failed**"
+            }
+
+            cd ..
+
+            # --- Branch-by-branch verification ---
+            git clone repo.git verify-src
+            git clone \
+              "https://${GH_TOKEN}@github.com/${GH_OWNER}/${TARGET_REPO}.git" \
+              verify-dst
+
+            cd verify-src
+            git lfs pull
+            BRANCHES=$(git for-each-ref --format='%(refname:short)' refs/heads)
+            cd ..
+
+            VERIFY_FAILED=0
+            VERIFY_LOG=""
+
+            for BR in $BRANCHES; do
+              cd verify-src
+              git checkout "$BR" >/dev/null 2>&1 || continue
+              git lfs pull
+              find . -type f ! -path "./.git/*" | sed 's|^\./||' | sort > ../src.txt
+              cd ..
+
+              cd verify-dst
+              git checkout "$BR" >/dev/null 2>&1 || {
+                VERIFY_FAILED=1
+                VERIFY_LOG+="\n❌ Missing branch: ${BR}"
+                cd ..
+                continue
+              }
+              git lfs pull
+              find . -type f ! -path "./.git/*" | sed 's|^\./||' | sort > ../dst.txt
+              cd ..
+
+              DIFF=$(diff -u src.txt dst.txt || true)
+              if [ -n "$DIFF" ]; then
+                VERIFY_FAILED=1
+                VERIFY_LOG+="\n### Branch: ${BR}\n\`\`\`diff\n${DIFF}\n\`\`\`"
+              fi
+            done
+
+            rm -rf repo.git verify-src verify-dst src.txt dst.txt
+
+            END_TS="$(date -u)"
+
+            if [ "$VERIFY_FAILED" -eq 1 ]; then
+              comment_issue "$ISSUE_NUMBER" "❌ **Verification failed**${VERIFY_LOG}"
+            else
+              comment_issue "$ISSUE_NUMBER" "✅ **Migration & verification successful**\n\n**Finished:** ${END_TS}"
+              close_issue "$ISSUE_NUMBER"
+            fi
+          done
